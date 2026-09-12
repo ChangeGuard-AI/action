@@ -1,0 +1,214 @@
+# ChangeGuard — judge a change before it ships.
+#
+# This is the CANONICAL judgment logic, versioned here under ChangeGuard's
+# control. Customer repositories call it; they do not copy it. That means a
+# customer's integration improves when this file improves, without anyone
+# touching their repository — and it means ChangeGuard never needs write access
+# to a customer's CI configuration.
+#
+# A caller repository contains only this:
+#
+#   name: ChangeGuard
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main]
+#   jobs:
+#     changeguard:
+#       uses: ChangeGuard-AI/action/.github/workflows/judge.yml@v1
+#       secrets: inherit
+#
+# IDENTITY. ChangeGuard mints change_id server-side and returns it. This
+# workflow captures it and exposes it as a job output so the caller can hand it
+# to outcome.yml after deploying. It never invents an id and never allows an
+# outcome to be attributed by recency — temporal proximity is not identity.
+
+name: ChangeGuard judge
+
+on:
+  workflow_call:
+    inputs:
+      backend_url:
+        description: 'ChangeGuard backend. Leave unset unless you were told otherwise.'
+        required: false
+        type: string
+        default: ''
+      environment:
+        description: 'Overrides the environment ChangeGuard configured for this repository.'
+        required: false
+        type: string
+        default: ''
+      enforce_block:
+        description: 'Fail the build on BLOCK. Set false to run advisory while you build confidence — the verdict is still recorded either way.'
+        required: false
+        type: boolean
+        default: true
+      enforce_hold:
+        description: 'Also fail on HOLD. Off by default: HOLD means "look at this", not "stop".'
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      change_id:
+        description: 'ChangeGuard change identity — pass to outcome.yml.'
+        value: ${{ jobs.judge.outputs.change_id }}
+      verdict_id:
+        description: 'ChangeGuard verdict identity — pass to outcome.yml.'
+        value: ${{ jobs.judge.outputs.verdict_id }}
+      verdict:
+        description: 'SHIP | HOLD | BLOCK | UNAVAILABLE'
+        value: ${{ jobs.judge.outputs.verdict }}
+      csc:
+        description: 'Confidence score 0-100.'
+        value: ${{ jobs.judge.outputs.csc }}
+
+jobs:
+  judge:
+    name: Judge the change
+    runs-on: ubuntu-latest
+    outputs:
+      change_id: ${{ steps.preflight.outputs.change_id }}
+      verdict_id: ${{ steps.preflight.outputs.verdict_id }}
+      verdict: ${{ steps.preflight.outputs.verdict }}
+      csc: ${{ steps.preflight.outputs.csc }}
+    steps:
+      - name: Pre-flight verdict
+        id: preflight
+        env:
+          CG_KEY: ${{ secrets.CHANGEGUARD_API_KEY }}
+          CG_URL_IN: ${{ inputs.backend_url }}
+          CG_URL_VAR: ${{ vars.CHANGEGUARD_BACKEND_URL }}
+          CG_ENV_IN: ${{ inputs.environment }}
+          CG_ENV_VAR: ${{ vars.CHANGEGUARD_CLUSTER }}
+        run: |
+          set -euo pipefail
+
+          # A failure message is only useful if it names the missing thing and
+          # says where to put it. "Finish connecting" tells someone who already
+          # knows what to do that they have not done it yet, which is nobody.
+          SECRET_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/settings/secrets/actions/new"
+
+          if [ -z "${CG_KEY}" ]; then
+            echo "::error title=ChangeGuard has no key for this repository::Add a repository secret named CHANGEGUARD_API_KEY here: ${SECRET_URL} -- the key itself comes from ChangeGuard, on the Preflight page, under GitHub Actions. Nothing in this workflow file needs editing."
+            exit 1
+          fi
+
+          CG_URL="${CG_URL_IN:-${CG_URL_VAR:-https://api.changeguard.ai}}"
+          CG_CLUSTER="${CG_ENV_IN:-${CG_ENV_VAR:-}}"
+
+          BODY=$(jq -n \
+            --arg cluster "${CG_CLUSTER}" \
+            --arg repo    "${GITHUB_REPOSITORY}" \
+            --arg sha     "${GITHUB_SHA}" \
+            --arg summary "${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            '{cluster_id: $cluster, source: "ci", mode: "fast",
+              change: {summary: $summary, pr: {repo: $repo, sha: $sha}}}')
+
+          # HTTP status is separated from the body so a misconfiguration is
+          # never mistaken for a clean verdict.
+          HTTP=$(curl -sS -o /tmp/cg-preflight.json -w '%{http_code}' \
+                   --max-time 30 -X POST "${CG_URL}/api/cicd/preflight" \
+                   -H 'Content-Type: application/json' \
+                   -H "X-API-Key: ${CG_KEY}" \
+                   -d "${BODY}") || HTTP="000"
+
+          case "${HTTP}" in
+            200) ;;
+            401|403)
+              echo "::error title=ChangeGuard rejected this repository::The CHANGEGUARD_API_KEY secret is wrong, revoked, or from a different account. Create a new key in ChangeGuard on the Preflight page, under GitHub Actions, then replace the secret here: ${SECRET_URL}"
+              exit 1 ;;
+            400|422)
+              echo "::error title=ChangeGuard could not read this change::$(jq -r '.error // .message // empty' /tmp/cg-preflight.json | head -c 300)"
+              exit 1 ;;
+            *)
+              # ChangeGuard is advisory: an outage must not take a pipeline down
+              # with it. The change is simply unjudged, and says so.
+              echo "::warning title=ChangeGuard could not be reached::No verdict for this change. Your pipeline continues."
+              echo "verdict=UNAVAILABLE" >> "${GITHUB_OUTPUT}"
+              exit 0 ;;
+          esac
+
+          VERDICT=$(jq -r '.verdict // "UNAVAILABLE"' /tmp/cg-preflight.json)
+          CSC=$(jq -r '.csc // empty' /tmp/cg-preflight.json)
+          CHANGE_ID=$(jq -r '.change_id // empty' /tmp/cg-preflight.json)
+          VERDICT_ID=$(jq -r '.verdict_id // empty' /tmp/cg-preflight.json)
+          EVIDENCE=$(jq -r '.environment_evidence // "unknown"' /tmp/cg-preflight.json)
+          # environment_state is the precise answer; environment_evidence is the
+          # older two-value one. Prefer the precise field when the backend sends
+          # it, so a customer whose agent merely stopped reporting is never told
+          # there is no environment.
+          ENVSTATE=$(jq -r '.environment_state // empty' /tmp/cg-preflight.json)
+
+          if [ -z "${CHANGE_ID}" ]; then
+            echo "::warning title=No change identity returned::The outcome for this change will not be linked to this judgment."
+          fi
+
+          {
+            echo "verdict=${VERDICT}"
+            echo "csc=${CSC}"
+            echo "change_id=${CHANGE_ID}"
+            echo "verdict_id=${VERDICT_ID}"
+          } >> "${GITHUB_OUTPUT}"
+
+          case "${VERDICT}" in
+            SHIP)  ICON="🟢"; HEAD="Clear to ship" ;;
+            HOLD)  ICON="🟡"; HEAD="Worth a look before shipping" ;;
+            BLOCK) ICON="🔴"; HEAD="Not safe to ship" ;;
+            *)     ICON="⚪"; HEAD="No verdict available" ;;
+          esac
+
+          case "${ENVSTATE:-}" in
+            fresh)
+              EVLINE="Judged against live evidence from **${CG_CLUSTER:-your environment}**." ;;
+            stale)
+              EVLINE="**${CG_CLUSTER}** is connected, but its last report is older than ChangeGuard will trust, so this change was judged on the change itself. Nothing needs reconnecting — the agent has stopped reporting." ;;
+            unknown)
+              EVLINE="No environment named **${CG_CLUSTER}** has ever reported to ChangeGuard, so this change was judged on the change itself. Check the name, or connect that environment." ;;
+            unnamed)
+              EVLINE="No environment was named for this repository, so this change was judged on the change itself." ;;
+            *)
+              # Backend predates environment_state. Fall back to the older field,
+              # and keep its wording honest about what absent actually means.
+              case "${EVIDENCE}" in
+                present) EVLINE="Judged against live evidence from **${CG_CLUSTER:-your environment}**." ;;
+                absent)  EVLINE="Judged on the change itself. ChangeGuard had no current environment evidence — that is an absence of evidence, not a clean result." ;;
+                *)       EVLINE="" ;;
+              esac ;;
+          esac
+
+          {
+            echo "## ${ICON} ChangeGuard — ${VERDICT}"
+            echo ""
+            echo "**${HEAD}** · confidence ${CSC:-n/a}/100"
+            echo ""
+            [ -n "${EVLINE}" ] && echo "${EVLINE}" && echo ""
+            jq -r '.reasons // [] | .[] | "- " + .' /tmp/cg-preflight.json
+            echo ""
+            if [ -n "${CHANGE_ID}" ]; then
+              echo "[View this Change in ChangeGuard](${CG_URL/api./app.}/changes/${CHANGE_ID})"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Apply the verdict
+        env:
+          VERDICT: ${{ steps.preflight.outputs.verdict }}
+          ENFORCE_BLOCK: ${{ inputs.enforce_block }}
+          ENFORCE_HOLD: ${{ inputs.enforce_hold }}
+        run: |
+          set -euo pipefail
+          case "${VERDICT}" in
+            BLOCK)
+              if [ "${ENFORCE_BLOCK}" = "true" ]; then
+                echo "::error title=ChangeGuard: not safe to ship::See the job summary for what ChangeGuard found."
+                exit 1
+              fi
+              echo "::warning title=ChangeGuard: not safe to ship (advisory)::enforce_block is false, so this pipeline continues." ;;
+            HOLD)
+              if [ "${ENFORCE_HOLD}" = "true" ]; then
+                echo "::error title=ChangeGuard: worth a look::enforce_hold is true."
+                exit 1
+              fi
+              echo "::warning title=ChangeGuard: worth a look before shipping::See the job summary." ;;
+            SHIP)  echo "ChangeGuard: clear to ship." ;;
+            *)     echo "ChangeGuard: no verdict available; continuing." ;;
+          esac

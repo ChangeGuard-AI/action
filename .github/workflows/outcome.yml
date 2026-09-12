@@ -1,0 +1,140 @@
+# ChangeGuard — report what actually happened.
+#
+# The second half of the lifecycle, and the half most tools skip. A verdict
+# nobody scores is an opinion; a verdict joined to its outcome is evidence.
+#
+# This is called AFTER the caller's own deploy job, with the identity that
+# judge.yml returned. Both ids travel: verdict_id is what makes the link
+# explicit rather than unlinked, and change_id is the lifecycle key the Change
+# record and the prediction-outcome measurement join on. Neither is ever
+# inferred from timing — an outcome posted without an explicit link is recorded
+# UNLINKED by design.
+#
+# A caller that closes the loop looks like this:
+#
+#   jobs:
+#     changeguard:
+#       uses: ChangeGuard-AI/action/.github/workflows/judge.yml@v1
+#       secrets: inherit
+#
+#     deploy:
+#       needs: changeguard
+#       if: github.event_name == 'push' && needs.changeguard.outputs.verdict != 'BLOCK'
+#       runs-on: ubuntu-latest
+#       steps:
+#         - run: ./your-real-deploy-command
+#
+#     outcome:
+#       needs: [changeguard, deploy]
+#       if: always() && github.event_name == 'push'
+#       uses: ChangeGuard-AI/action/.github/workflows/outcome.yml@v1
+#       with:
+#         change_id:  ${{ needs.changeguard.outputs.change_id }}
+#         verdict_id: ${{ needs.changeguard.outputs.verdict_id }}
+#         deploy_result: ${{ needs.deploy.result }}
+#       secrets: inherit
+#
+# The deploy stays in the customer's own workflow, visible to them, run by them.
+# ChangeGuard brackets it rather than hiding it.
+
+name: ChangeGuard outcome
+
+on:
+  workflow_call:
+    inputs:
+      change_id:
+        description: 'From judge.yml outputs.'
+        required: true
+        type: string
+      verdict_id:
+        description: 'From judge.yml outputs.'
+        required: true
+        type: string
+      deploy_result:
+        description: 'The deploy job result: success | failure | cancelled | skipped.'
+        required: true
+        type: string
+      backend_url:
+        required: false
+        type: string
+        default: ''
+      environment:
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  outcome:
+    name: Report the outcome
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report to ChangeGuard
+        env:
+          CG_KEY: ${{ secrets.CHANGEGUARD_API_KEY }}
+          CG_URL_IN: ${{ inputs.backend_url }}
+          CG_URL_VAR: ${{ vars.CHANGEGUARD_BACKEND_URL }}
+          CG_ENV_IN: ${{ inputs.environment }}
+          CG_ENV_VAR: ${{ vars.CHANGEGUARD_CLUSTER }}
+          CHANGE_ID: ${{ inputs.change_id }}
+          VERDICT_ID: ${{ inputs.verdict_id }}
+          DEPLOY_RESULT: ${{ inputs.deploy_result }}
+        run: |
+          set -euo pipefail
+
+          CG_URL="${CG_URL_IN:-${CG_URL_VAR:-https://api.changeguard.ai}}"
+          CG_CLUSTER="${CG_ENV_IN:-${CG_ENV_VAR:-}}"
+
+          SECRET_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/settings/secrets/actions/new"
+
+          if [ -z "${CG_KEY}" ]; then
+            echo "::warning title=ChangeGuard has no key for this repository::This deployment happened, but its outcome was not recorded. Add a repository secret named CHANGEGUARD_API_KEY here: ${SECRET_URL}"
+            exit 0
+          fi
+
+          # Nothing to attribute is a real state, and it is stated rather than
+          # papered over with a guess.
+          if [ -z "${VERDICT_ID}" ] && [ -z "${CHANGE_ID}" ]; then
+            echo "::warning title=Nothing to attribute::No verdict was recorded for this change, so there is no outcome to attach to it."
+            exit 0
+          fi
+
+          case "${DEPLOY_RESULT}" in
+            success)   OUTCOME="success";  INCIDENT="false" ;;
+            skipped)   echo "::notice title=Nothing deployed::The deploy was skipped, so no outcome was recorded."; exit 0 ;;
+            cancelled) echo "::notice title=Deploy cancelled::No outcome recorded."; exit 0 ;;
+            *)         OUTCOME="incident"; INCIDENT="true" ;;
+          esac
+
+          BODY=$(jq -n \
+            --arg cluster    "${CG_CLUSTER}" \
+            --arg change_id  "${CHANGE_ID}" \
+            --arg verdict_id "${VERDICT_ID}" \
+            --arg outcome    "${OUTCOME}" \
+            --argjson incident ${INCIDENT} \
+            --arg notes      "GitHub Actions run ${GITHUB_RUN_ID}" \
+            '{cluster_id: $cluster, change_id: $change_id, verdict_id: $verdict_id,
+              outcome: $outcome, incident: $incident, detected_by: "ci", notes: $notes}')
+
+          HTTP=$(curl -sS -o /tmp/cg-outcome.json -w '%{http_code}' \
+                   --max-time 30 -X POST "${CG_URL}/api/cicd/outcome" \
+                   -H 'Content-Type: application/json' \
+                   -H "X-API-Key: ${CG_KEY}" \
+                   -d "${BODY}") || HTTP="000"
+
+          if [ "${HTTP}" != "200" ]; then
+            echo "::warning title=Outcome not recorded::ChangeGuard returned ${HTTP}. The judgment is still on record; what happened afterwards is not."
+            exit 0
+          fi
+
+          case "${OUTCOME}" in
+            success)  ICON="🟢"; LINE="Deployed successfully." ;;
+            *)        ICON="🔴"; LINE="The deployment failed. ChangeGuard has recorded this against the change it judged." ;;
+          esac
+
+          {
+            echo "## ${ICON} ChangeGuard — outcome recorded"
+            echo ""
+            echo "${LINE}"
+            echo ""
+            echo "[View the full lifecycle in ChangeGuard](${CG_URL/api./app.}/changes/${CHANGE_ID})"
+          } >> "${GITHUB_STEP_SUMMARY}"
