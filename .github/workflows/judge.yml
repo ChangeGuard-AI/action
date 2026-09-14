@@ -67,7 +67,7 @@ on:
         type: string
         default: ''
       environment:
-        description: 'Overrides the environment ChangeGuard configured for this repository.'
+        description: 'Names the environment to judge against. Honoured on the API-key path. On the OIDC path the connection decides and this is only a request — if it is not granted, the run says so rather than letting you read a verdict about the wrong environment.'
         required: false
         type: string
         default: ''
@@ -553,10 +553,24 @@ jobs:
           # it, so a customer whose agent merely stopped reporting is never told
           # there is no environment.
           ENVSTATE=$(jq -r '.environment_state // empty' /tmp/cg-preflight.json)
-          # On the OIDC path the environment comes from the connection, not from
-          # this file, so report back what ChangeGuard actually judged against.
+          # On the OIDC path the environment comes from the CONNECTION, not from
+          # this file. ChangeGuard binds a repository's CI to the environment it
+          # was connected to, on purpose: a workflow file is edited by anyone who
+          # can open a pull request, and letting it name any environment it liked
+          # would make the binding decorative.
+          #
+          # So `environment:` is a request, not an instruction — and when it is
+          # not granted the customer is told, rather than reading a verdict about
+          # one environment while believing it is about another. Silence here
+          # would be the most expensive kind: correct, and misleading.
           ENVNAME=$(jq -r '.cluster_id // .environment // empty' /tmp/cg-preflight.json)
+          ENVASKED="${CG_CLUSTER}"
           [ -n "${ENVNAME}" ] && CG_CLUSTER="${ENVNAME}"
+          ENVNOTE=""
+          if [ -n "${ENVASKED}" ] && [ -n "${CG_CLUSTER}" ] && [ "${ENVASKED}" != "${CG_CLUSTER}" ]; then
+            ENVNOTE="This workflow asked for **${ENVASKED}**, and ChangeGuard judged **${CG_CLUSTER}** — the environment this repository is connected to. The connection decides, not the workflow file. Change it where the repository was connected."
+            echo "::warning title=ChangeGuard judged a different environment::asked for ${ENVASKED}, judged ${CG_CLUSTER} (the connected one)"
+          fi
 
           if [ -z "${CHANGE_ID}" ]; then
             echo "::warning title=No change identity returned::The outcome for this change will not be linked to this judgment."
@@ -608,6 +622,7 @@ jobs:
             fi
             echo ""
             [ -n "${EVLINE}" ] && echo "${EVLINE}" && echo ""
+            [ -n "${ENVNOTE}" ] && echo "${ENVNOTE}" && echo ""
             if [ "${CG_MANIFEST_COUNT:-0}" != "0" ]; then
               echo "Judged the change you proposed: \`${CG_MANIFEST_FILES}\`."
             elif [ -n "${CG_MANIFEST_NOTE:-}" ]; then
