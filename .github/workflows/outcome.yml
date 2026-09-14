@@ -10,12 +10,20 @@
 # inferred from timing — an outcome posted without an explicit link is recorded
 # UNLINKED by design.
 #
+# It authenticates the same two ways judge.yml does: a GitHub Actions identity
+# token by default, or CHANGEGUARD_API_KEY where one is set. Because this runs
+# as its own job, it needs its own `id-token: write` — a permission granted to
+# the judge job does not carry to this one.
+#
 # A caller that closes the loop looks like this:
+#
+#   permissions:
+#     contents: read
+#     id-token: write
 #
 #   jobs:
 #     changeguard:
 #       uses: ChangeGuard-AI/action/.github/workflows/judge.yml@v1
-#       secrets: inherit
 #
 #     deploy:
 #       needs: changeguard
@@ -32,7 +40,6 @@
 #         change_id:  ${{ needs.changeguard.outputs.change_id }}
 #         verdict_id: ${{ needs.changeguard.outputs.verdict_id }}
 #         deploy_result: ${{ needs.deploy.result }}
-#       secrets: inherit
 #
 # The deploy stays in the customer's own workflow, visible to them, run by them.
 # ChangeGuard brackets it rather than hiding it.
@@ -62,11 +69,19 @@ on:
         required: false
         type: string
         default: ''
+    secrets:
+      CHANGEGUARD_API_KEY:
+        description: 'Only for repositories connected before OIDC. Leave unset to use the GitHub identity token.'
+        required: false
 
 jobs:
   outcome:
     name: Report the outcome
     runs-on: ubuntu-latest
+    # No `permissions:` block, for the same reason as judge.yml: a reusable
+    # workflow can only narrow what the caller granted, so declaring
+    # id-token: write here would break every existing API-key caller at parse
+    # time rather than enabling anything.
     steps:
       - name: Report to ChangeGuard
         env:
@@ -83,16 +98,11 @@ jobs:
 
           CG_URL="${CG_URL_IN:-${CG_URL_VAR:-https://api.changeguard.ai}}"
           CG_CLUSTER="${CG_ENV_IN:-${CG_ENV_VAR:-}}"
-
-          SECRET_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/settings/secrets/actions/new"
-
-          if [ -z "${CG_KEY}" ]; then
-            echo "::warning title=ChangeGuard has no key for this repository::This deployment happened, but its outcome was not recorded. Add a repository secret named CHANGEGUARD_API_KEY here: ${SECRET_URL}"
-            exit 0
-          fi
+          APP_URL="${CG_URL/api./app.}"
 
           # Nothing to attribute is a real state, and it is stated rather than
-          # papered over with a guess.
+          # papered over with a guess. Checked before authentication, because
+          # there is no point authenticating to post nothing.
           if [ -z "${VERDICT_ID}" ] && [ -z "${CHANGE_ID}" ]; then
             echo "::warning title=Nothing to attribute::No verdict was recorded for this change, so there is no outcome to attach to it."
             exit 0
@@ -105,6 +115,38 @@ jobs:
             *)         OUTCOME="incident"; INCIDENT="true" ;;
           esac
 
+          # ── Credential selection. Same order as judge.yml: an explicit key
+          # wins, otherwise the GitHub identity token.
+          CG_AUTH_MODE=""
+          CG_TOKEN=""
+          if [ -n "${CG_KEY:-}" ]; then
+            CG_AUTH_MODE="api_key"
+          elif [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            IDT_HTTP=$(curl -sS -o /tmp/cg-idt.json -w '%{http_code}' --max-time 20 \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              -H 'Accept: application/json; api-version=2.0' \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=changeguard") || IDT_HTTP="000"
+            if [ "${IDT_HTTP}" = "200" ]; then
+              CG_TOKEN=$(jq -r '.value // empty' /tmp/cg-idt.json)
+            fi
+            if [ -n "${CG_TOKEN}" ]; then
+              CG_AUTH_MODE="oidc"
+            fi
+          fi
+
+          # A deployment that already happened must not be turned into a failed
+          # build by a reporting problem, so everything from here is a warning.
+          # But the warning has to say plainly that the record is incomplete:
+          # an unrecorded outcome is a gap in the evidence, not a detail.
+          if [ -z "${CG_AUTH_MODE}" ]; then
+            if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+              echo "::warning title=This deployment was not recorded::ChangeGuard judged this change, but could not record what happened to it, because this job is not allowed to prove who it is. Add 'id-token: write' under 'permissions:' in the workflow that calls ChangeGuard. The judgment is on record; the outcome is missing."
+            else
+              echo "::warning title=This deployment was not recorded::GitHub returned HTTP ${IDT_HTTP:-000} when this job asked for its identity token. The judgment is on record; the outcome is missing."
+            fi
+            exit 0
+          fi
+
           BODY=$(jq -n \
             --arg cluster    "${CG_CLUSTER}" \
             --arg change_id  "${CHANGE_ID}" \
@@ -115,14 +157,23 @@ jobs:
             '{cluster_id: $cluster, change_id: $change_id, verdict_id: $verdict_id,
               outcome: $outcome, incident: $incident, detected_by: "ci", notes: $notes}')
 
-          HTTP=$(curl -sS -o /tmp/cg-outcome.json -w '%{http_code}' \
-                   --max-time 30 -X POST "${CG_URL}/api/cicd/outcome" \
-                   -H 'Content-Type: application/json' \
-                   -H "X-API-Key: ${CG_KEY}" \
-                   -d "${BODY}") || HTTP="000"
+          if [ "${CG_AUTH_MODE}" = "api_key" ]; then
+            HTTP=$(curl -sS -o /tmp/cg-outcome.json -w '%{http_code}' \
+                     --max-time 30 -X POST "${CG_URL}/api/cicd/outcome" \
+                     -H 'Content-Type: application/json' \
+                     -H "X-API-Key: ${CG_KEY}" \
+                     -d "${BODY}") || HTTP="000"
+          else
+            HTTP=$(curl -sS -o /tmp/cg-outcome.json -w '%{http_code}' \
+                     --max-time 30 -X POST "${CG_URL}/api/cicd/outcome" \
+                     -H 'Content-Type: application/json' \
+                     -H "Authorization: Bearer ${CG_TOKEN}" \
+                     -d "${BODY}") || HTTP="000"
+          fi
 
           if [ "${HTTP}" != "200" ]; then
-            echo "::warning title=Outcome not recorded::ChangeGuard returned ${HTTP}. The judgment is still on record; what happened afterwards is not."
+            CG_MSG=$(jq -r '.error // .message // empty' /tmp/cg-outcome.json 2>/dev/null | head -c 300)
+            echo "::warning title=Outcome not recorded::ChangeGuard returned ${HTTP}. ${CG_MSG} The judgment is still on record; what happened afterwards is not."
             exit 0
           fi
 
@@ -136,5 +187,5 @@ jobs:
             echo ""
             echo "${LINE}"
             echo ""
-            echo "[View the full lifecycle in ChangeGuard](${CG_URL/api./app.}/changes/${CHANGE_ID})"
+            echo "[View the full lifecycle in ChangeGuard](${APP_URL}/changes/${CHANGE_ID})"
           } >> "${GITHUB_STEP_SUMMARY}"

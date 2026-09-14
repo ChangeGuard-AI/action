@@ -13,10 +13,28 @@
 #     pull_request:
 #     push:
 #       branches: [main]
+#   permissions:
+#     contents: read
+#     id-token: write
 #   jobs:
 #     changeguard:
 #       uses: ChangeGuard-AI/action/.github/workflows/judge.yml@v1
-#       secrets: inherit
+#
+# HOW IT AUTHENTICATES. Two ways, tried in this order:
+#
+#   1. GitHub Actions OIDC (default, and what the setup flow generates).
+#      GitHub mints a short-lived token stating which repository this job is
+#      running in, signed by GitHub. ChangeGuard verifies it and looks the
+#      repository up in the connection the customer made. Nothing to create,
+#      nothing to paste into GitHub, nothing to rotate, nothing to leak. This
+#      is why the caller needs `id-token: write` — without it GitHub will not
+#      mint the token, and there is nothing this workflow can do about that.
+#
+#   2. CHANGEGUARD_API_KEY (unchanged, for repositories set up before OIDC and
+#      for anyone who prefers it). Pass it with `secrets: inherit`.
+#
+# If both are available the API key wins, because a customer who set one is
+# telling us which identity to use.
 #
 # IDENTITY. ChangeGuard mints change_id server-side and returns it. This
 # workflow captures it and exposes it as a job output so the caller can hand it
@@ -48,6 +66,10 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      CHANGEGUARD_API_KEY:
+        description: 'Only for repositories connected before OIDC. Leave unset to use the GitHub identity token.'
+        required: false
     outputs:
       change_id:
         description: 'ChangeGuard change identity — pass to outcome.yml.'
@@ -66,6 +88,18 @@ jobs:
   judge:
     name: Judge the change
     runs-on: ubuntu-latest
+    # DELIBERATELY NO `permissions:` BLOCK.
+    #
+    # A reusable workflow's permissions can only narrow the caller's, never
+    # widen them. Declaring `id-token: write` here would therefore not enable
+    # anything — it would hard-fail, at workflow-parse time, for every existing
+    # caller whose repository has not granted id-token, before a single step
+    # ran. Those callers authenticate with an API key and must keep working
+    # untouched.
+    #
+    # Omitting the block means this job inherits whatever the caller granted:
+    # a new caller grants id-token: write and gets OIDC, an older one grants
+    # nothing extra and uses its key. The step below detects which it got.
     outputs:
       change_id: ${{ steps.preflight.outputs.change_id }}
       verdict_id: ${{ steps.preflight.outputs.verdict_id }}
@@ -83,18 +117,46 @@ jobs:
         run: |
           set -euo pipefail
 
-          # A failure message is only useful if it names the missing thing and
-          # says where to put it. "Finish connecting" tells someone who already
-          # knows what to do that they have not done it yet, which is nobody.
-          SECRET_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/settings/secrets/actions/new"
-
-          if [ -z "${CG_KEY}" ]; then
-            echo "::error title=ChangeGuard has no key for this repository::Add a repository secret named CHANGEGUARD_API_KEY here: ${SECRET_URL} -- the key itself comes from ChangeGuard, on the Preflight page, under GitHub Actions. Nothing in this workflow file needs editing."
-            exit 1
-          fi
-
           CG_URL="${CG_URL_IN:-${CG_URL_VAR:-https://api.changeguard.ai}}"
           CG_CLUSTER="${CG_ENV_IN:-${CG_ENV_VAR:-}}"
+          APP_URL="${CG_URL/api./app.}"
+
+          # ── Credential selection ────────────────────────────────────────
+          # An explicit API key wins: a customer who set one is telling us
+          # which identity to use, and silently authenticating as something
+          # else would be a surprising way to be authorised.
+          CG_AUTH_MODE=""
+          CG_TOKEN=""
+          if [ -n "${CG_KEY:-}" ]; then
+            CG_AUTH_MODE="api_key"
+          elif [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            # The audience matters. GitHub's default audience is the repository
+            # owner's URL, which every other integration also receives; asking
+            # for our own means the token we present was minted for us and
+            # cannot be a replay of one issued to something else.
+            IDT_HTTP=$(curl -sS -o /tmp/cg-idt.json -w '%{http_code}' --max-time 20 \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              -H 'Accept: application/json; api-version=2.0' \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=changeguard") || IDT_HTTP="000"
+            if [ "${IDT_HTTP}" = "200" ]; then
+              CG_TOKEN=$(jq -r '.value // empty' /tmp/cg-idt.json)
+            fi
+            if [ -n "${CG_TOKEN}" ]; then
+              CG_AUTH_MODE="oidc"
+            fi
+          fi
+
+          if [ -z "${CG_AUTH_MODE}" ]; then
+            if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+              # Much the most likely cause, and the only one the customer can
+              # fix, so it gets named precisely rather than lumped in with
+              # "authentication failed".
+              echo "::error title=This workflow is not allowed to prove who it is::ChangeGuard signs in with a GitHub identity token, and GitHub only issues one when the workflow asks for permission. Add these two lines to the workflow that calls ChangeGuard, directly under the 'on:' block:%0A%0Apermissions:%0A  contents: read%0A  id-token: write%0A%0AChangeGuard's setup screen generates this for you if you would rather re-run it."
+            else
+              echo "::error title=GitHub would not issue an identity token::GitHub returned HTTP ${IDT_HTTP:-000} when this job asked for its identity token, so ChangeGuard has nothing to verify. This is a GitHub-side failure and is usually temporary — re-run the job. If it keeps happening, connect the repository again from ChangeGuard."
+            fi
+            exit 1
+          fi
 
           BODY=$(jq -n \
             --arg cluster "${CG_CLUSTER}" \
@@ -106,25 +168,65 @@ jobs:
 
           # HTTP status is separated from the body so a misconfiguration is
           # never mistaken for a clean verdict.
-          HTTP=$(curl -sS -o /tmp/cg-preflight.json -w '%{http_code}' \
-                   --max-time 30 -X POST "${CG_URL}/api/cicd/preflight" \
-                   -H 'Content-Type: application/json' \
-                   -H "X-API-Key: ${CG_KEY}" \
-                   -d "${BODY}") || HTTP="000"
+          if [ "${CG_AUTH_MODE}" = "api_key" ]; then
+            HTTP=$(curl -sS -o /tmp/cg-preflight.json -w '%{http_code}' \
+                     --max-time 30 -X POST "${CG_URL}/api/cicd/preflight" \
+                     -H 'Content-Type: application/json' \
+                     -H "X-API-Key: ${CG_KEY}" \
+                     -d "${BODY}") || HTTP="000"
+          else
+            HTTP=$(curl -sS -o /tmp/cg-preflight.json -w '%{http_code}' \
+                     --max-time 30 -X POST "${CG_URL}/api/cicd/preflight" \
+                     -H 'Content-Type: application/json' \
+                     -H "Authorization: Bearer ${CG_TOKEN}" \
+                     -d "${BODY}") || HTTP="000"
+          fi
+
+          # ChangeGuard's refusals are written to be read by the person who has
+          # to fix them, so they are surfaced rather than paraphrased.
+          CG_MSG=$(jq -r '.error // .message // empty' /tmp/cg-preflight.json 2>/dev/null | head -c 400)
 
           case "${HTTP}" in
             200) ;;
-            401|403)
-              echo "::error title=ChangeGuard rejected this repository::The CHANGEGUARD_API_KEY secret is wrong, revoked, or from a different account. Create a new key in ChangeGuard on the Preflight page, under GitHub Actions, then replace the secret here: ${SECRET_URL}"
+            401)
+              if [ "${CG_AUTH_MODE}" = "api_key" ]; then
+                SECRET_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/settings/secrets/actions/new"
+                echo "::error title=ChangeGuard rejected this repository::The CHANGEGUARD_API_KEY secret is wrong, revoked, or from a different account. Create a new key in ChangeGuard on the Preflight page, under GitHub Actions, then replace the secret here: ${SECRET_URL}%0A%0AOr remove the secret entirely and re-run ChangeGuard's setup to switch this repository to GitHub identity tokens, which need no secret at all."
+              else
+                echo "::error title=ChangeGuard did not accept this repository's identity token::${CG_MSG:-The token GitHub issued was not accepted.} This normally means the clock, the audience, or the token itself was wrong rather than anything you configured — re-run the job. If it persists, reconnect the repository from ChangeGuard."
+              fi
+              exit 1 ;;
+            403)
+              # Several different refusals arrive as 403: never connected, the
+              # connection was revoked, the account is suspended, the
+              # subscription expired. The backend knows which, and each of its
+              # messages already carries the right instruction — "Reconnect it
+              # in ChangeGuard under Integrations", or "Contact support".
+              #
+              # So this states no cause of its own. An earlier version titled
+              # every 403 "not connected to this repository", which sat above a
+              # body reading "Account suspended" and sent a billing problem to
+              # the integrations page. A title that contradicts its own message
+              # is worse than a vague one.
+              echo "::error title=ChangeGuard refused to judge this change::${CG_MSG:-ChangeGuard is not connected to ${GITHUB_REPOSITORY}. Connect it, then re-run this job.}"
+              exit 1 ;;
+            409)
+              echo "::error title=More than one ChangeGuard account has this repository::${CG_MSG:-ChangeGuard will not guess which account this job belongs to.} Open ${APP_URL}/integrations and disconnect ${GITHUB_REPOSITORY} from the account that should not have it."
               exit 1 ;;
             400|422)
-              echo "::error title=ChangeGuard could not read this change::$(jq -r '.error // .message // empty' /tmp/cg-preflight.json | head -c 300)"
+              echo "::error title=ChangeGuard could not read this change::${CG_MSG}"
               exit 1 ;;
             *)
               # ChangeGuard is advisory: an outage must not take a pipeline down
               # with it. The change is simply unjudged, and says so.
               echo "::warning title=ChangeGuard could not be reached::No verdict for this change. Your pipeline continues."
               echo "verdict=UNAVAILABLE" >> "${GITHUB_OUTPUT}"
+              {
+                echo "## ⚪ ChangeGuard — UNAVAILABLE"
+                echo ""
+                echo "ChangeGuard could not be reached (HTTP ${HTTP}), so this change was **not judged**."
+                echo "That is an absence of a verdict, not a clean one."
+              } >> "${GITHUB_STEP_SUMMARY}"
               exit 0 ;;
           esac
 
@@ -138,6 +240,10 @@ jobs:
           # it, so a customer whose agent merely stopped reporting is never told
           # there is no environment.
           ENVSTATE=$(jq -r '.environment_state // empty' /tmp/cg-preflight.json)
+          # On the OIDC path the environment comes from the connection, not from
+          # this file, so report back what ChangeGuard actually judged against.
+          ENVNAME=$(jq -r '.cluster_id // .environment // empty' /tmp/cg-preflight.json)
+          [ -n "${ENVNAME}" ] && CG_CLUSTER="${ENVNAME}"
 
           if [ -z "${CHANGE_ID}" ]; then
             echo "::warning title=No change identity returned::The outcome for this change will not be linked to this judgment."
@@ -185,7 +291,7 @@ jobs:
             jq -r '.reasons // [] | .[] | "- " + .' /tmp/cg-preflight.json
             echo ""
             if [ -n "${CHANGE_ID}" ]; then
-              echo "[View this Change in ChangeGuard](${CG_URL/api./app.}/changes/${CHANGE_ID})"
+              echo "[View this Change in ChangeGuard](${APP_URL}/changes/${CHANGE_ID})"
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
