@@ -40,6 +40,21 @@
 # workflow captures it and exposes it as a job output so the caller can hand it
 # to outcome.yml after deploying. It never invents an id and never allows an
 # outcome to be attributed by recency — temporal proximity is not identity.
+#
+# WHAT IT SENDS. The Kubernetes manifests this change touches, so Preflight
+# judges the PROPOSED OBJECT and not merely the environment it would land in.
+# Every deterministic rule Preflight has — will these replicas fit the
+# namespace quota, is this image pinned to a digest, does this ServiceAccount
+# already hold cluster-admin, does this Service have anything to select — takes
+# the proposed object as its input. Without one they have nothing to evaluate
+# and silently do not run, which produces a verdict that looks like a judgment
+# of the change and is a judgment of the cluster.
+#
+# Manifests are discovered by asking GitHub which files this change touched and
+# reading those files back. No repository checkout, no third-party action, and
+# no permission beyond the `contents: read` the caller already grants. Files
+# are included only if they look like Kubernetes objects; anything left out is
+# named in the job summary rather than passed over in silence.
 
 name: ChangeGuard judge
 
@@ -52,7 +67,7 @@ on:
         type: string
         default: ''
       environment:
-        description: 'Overrides the environment ChangeGuard configured for this repository.'
+        description: 'Names the environment to judge against. Honoured on the API-key path. On the OIDC path the connection decides and this is only a request — if it is not granted, the run says so rather than letting you read a verdict about the wrong environment.'
         required: false
         type: string
         default: ''
@@ -106,6 +121,269 @@ jobs:
       verdict: ${{ steps.preflight.outputs.verdict }}
       csc: ${{ steps.preflight.outputs.csc }}
     steps:
+      - name: Find what this change proposes
+        id: proposed
+        env:
+          # Untrusted inputs (a branch name, a PR title) reach this script
+          # ONLY through the environment. Interpolating them into the script
+          # body would let a pull request title run commands in a job holding
+          # the caller's token — a public, well-worn way to lose a repository.
+          GH_TOKEN: ${{ github.token }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          API="${GITHUB_API_URL:-https://api.github.com}/repos/${GITHUB_REPOSITORY}"
+          AUTH="Authorization: Bearer ${GH_TOKEN}"
+          VER='X-GitHub-Api-Version: 2022-11-28'
+          : > /tmp/cg-manifest.yaml
+          : > /tmp/cg-ids.txt
+          COUNT=0
+          BYTES=0
+          FILES=""
+          SKIPPED=""
+          UNREADABLE=""
+          DUPES=""
+          NOTE=""
+
+          # ── What a changed file actually IS ─────────────────────────────
+          #
+          # Every question the step has to answer — is this a Kubernetes
+          # object, will it parse, is it a build instruction, which object
+          # does it define — is one YAML load. Doing it by grepping for
+          # `kind:` answers none of them properly: a cache setting whose
+          # value is `kind: redis` is not a manifest, a kustomization.yaml is
+          # not an object, and a file with a broken indent is a manifest the
+          # customer needs told about rather than one to pass over.
+          cat > /tmp/cg-classify.py <<'CG_CLASSIFY_EOF'
+          import sys
+          try:
+              import yaml
+          except Exception:
+              print("nopy|"); sys.exit(0)
+          try:
+              raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          except Exception as e:
+              print("invalid|could not read the file: %s" % e); sys.exit(0)
+          try:
+              # Every document, not just the first: a file whose second document is
+              # broken is still a file ChangeGuard cannot read.
+              docs = list(yaml.safe_load_all(raw))
+          except yaml.YAMLError as e:
+              msg = str(getattr(e, "problem", None) or e).strip().replace("\n", " ")
+              mark = getattr(e, "problem_mark", None)
+              if mark is not None:
+                  msg = "line %d: %s" % (mark.line + 1, msg)
+              print("invalid|%s" % msg[:200]); sys.exit(0)
+          except Exception as e:
+              print("invalid|%s" % str(e)[:200].replace("\n", " ")); sys.exit(0)
+          ids = []
+          kustomize = ""
+          for d in docs:
+              if not isinstance(d, dict):
+                  continue
+              kind, api = d.get("kind"), d.get("apiVersion")
+              # Two checks, deliberately separate. Either one alone excludes
+              # most non-manifests, so a combined test lets one half rot
+              # unnoticed — and each is doing real work: a config file whose
+              # top-level key is `kind` has no apiVersion, and a Helm
+              # Chart.yaml has an apiVersion and no kind.
+              if not isinstance(api, str) or not api.strip():
+                  continue
+              if not isinstance(kind, str) or not kind.strip():
+                  continue
+              # Kustomize describes how to BUILD manifests. Judging the instruction
+              # rather than the object it produces reports on the wrong thing while
+              # looking like it judged the change.
+              if kind in ("Kustomization", "Component") and "kustomize" in api:
+                  kustomize = kind
+                  continue
+              meta = d.get("metadata")
+              meta = meta if isinstance(meta, dict) else {}
+              name, ns = meta.get("name"), meta.get("namespace")
+              ids.append("%s/%s/%s" % (
+                  kind.strip(),
+                  ns if isinstance(ns, str) and ns.strip() else "default",
+                  name if isinstance(name, str) and name.strip() else "?"))
+          if ids:
+              print("object|%s" % ";".join(ids))
+          elif kustomize:
+              print("kustomize|%s" % kustomize)
+          else:
+              print("notk8s|")
+          CG_CLASSIFY_EOF
+
+          # The range. For a pull request HEAD is the merge commit GitHub
+          # created, which is what would actually land, so the files read
+          # below are the merged result rather than the branch in isolation.
+          BASE=""
+          if [ -n "${PR_BASE_SHA:-}" ]; then
+            BASE="${PR_BASE_SHA}"
+          elif [ -n "${PUSH_BEFORE:-}" ] && [ "${PUSH_BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            BASE="${PUSH_BEFORE}"
+          fi
+
+          if [ -z "${BASE}" ]; then
+            # A branch's first push has no previous state. Diffing against
+            # everything would submit the whole repository as though a
+            # customer had proposed all of it at once.
+            NOTE="This is the first push to this branch, so there is no previous state to compare against. ChangeGuard judged the environment rather than a proposed object."
+          else
+            CMP=$(curl -sS --max-time 30 -o /tmp/cg-compare.json -w '%{http_code}' \
+                    -H "${AUTH}" -H 'Accept: application/vnd.github+json' -H "${VER}" \
+                    "${API}/compare/${BASE}...${GITHUB_SHA}") || CMP="000"
+            if [ "${CMP}" != "200" ]; then
+              NOTE="ChangeGuard could not read which files this change touches (GitHub returned HTTP ${CMP}), so it judged the environment rather than a proposed object."
+            else
+              # A deleted file proposes no object. A rename is read at its new
+              # path, which is the object that will exist.
+              jq -r '[.files // [] | .[]
+                      | select(.status != "removed")
+                      | .filename
+                      | select(test("\\.ya?ml$"))] | .[]' \
+                 /tmp/cg-compare.json > /tmp/cg-candidates.txt || : > /tmp/cg-candidates.txt
+
+              while IFS= read -r F; do
+                [ -n "${F}" ] || continue
+                if [ "${COUNT}" -ge 20 ]; then
+                  SKIPPED="${SKIPPED}${SKIPPED:+, }${F}"
+                  continue
+                fi
+                RAW=$(curl -sS --max-time 30 -o /tmp/cg-file.yaml -w '%{http_code}' \
+                        -H "${AUTH}" -H 'Accept: application/vnd.github.raw' -H "${VER}" \
+                        "${API}/contents/${F}?ref=${GITHUB_SHA}") || RAW="000"
+                [ "${RAW}" = "200" ] || continue
+
+                # Templates first, and textually, because a Helm template
+                # usually is not valid YAML — classifying it would report a
+                # syntax error in a file whose syntax is fine until it is
+                # rendered.
+                #
+                # But `{{` alone does not make a file a Helm template. A
+                # GitHub Actions workflow is full of expression syntax and
+                # is not a manifest in any state of rendering (this comment
+                # cannot show you the syntax, because GitHub expands it inside
+                # a run block too — which is how this file broke the first
+                # time). Telling its author to
+                # "point it at the output of helm template" is a confident
+                # answer to a question nobody asked. A templated file is only
+                # reported as a template if it is at least TRYING to be a
+                # Kubernetes object; one that is not is simply not a candidate,
+                # and is passed over the same as any other YAML in the repo.
+                if grep -qF '{{' /tmp/cg-file.yaml; then
+                  if grep -qE '^[[:space:]]*apiVersion:' /tmp/cg-file.yaml; then
+                    SKIPPED="${SKIPPED}${SKIPPED:+, }${F} (a template — ChangeGuard judges rendered manifests, so point it at the output of helm template or kustomize build)"
+                  fi
+                  continue
+                fi
+
+                # The exit status is kept separate from the answer. A
+                # classifier that CRASHED and one that found no YAML parser
+                # are different facts, and reporting the second when the first
+                # happened would be a small lie in the place this step exists
+                # to stop telling them.
+                if CLASS=$(python3 /tmp/cg-classify.py /tmp/cg-file.yaml 2>/dev/null); then
+                  :
+                else
+                  CLASS="crashed|"
+                fi
+                KIND="${CLASS%%|*}"
+                DETAIL="${CLASS#*|}"
+
+                if [ "${KIND}" = "nopy" ] || [ "${KIND}" = "crashed" ]; then
+                  # Fall back to a textual sniff rather than dropping the
+                  # change on the floor — but say which shallower check the
+                  # customer actually got, and why.
+                  if [ "${KIND}" = "nopy" ]; then
+                    WHY="This runner has no YAML parser, so manifests were identified by inspection rather than parsed."
+                  else
+                    WHY="ChangeGuard could not classify one or more files and fell back to identifying manifests by inspection. The verdict below still stands on what was submitted."
+                  fi
+                  case "${NOTE}" in
+                    *"${WHY}"*) : ;;
+                    *) NOTE="${NOTE}${NOTE:+ }${WHY}" ;;
+                  esac
+                  grep -qE '^[[:space:]]*apiVersion:' /tmp/cg-file.yaml || continue
+                  grep -qE '^[[:space:]]*kind:' /tmp/cg-file.yaml || continue
+                  KIND="object"
+                  DETAIL=""
+                fi
+
+                case "${KIND}" in
+                  notk8s)
+                    # Not a candidate and never was. Listing every YAML file
+                    # in the repository as "not judged" would bury the cases
+                    # that matter.
+                    continue ;;
+                  kustomize)
+                    SKIPPED="${SKIPPED}${SKIPPED:+, }${F} (${DETAIL} builds manifests rather than being one — ChangeGuard judges the manifests it produces)"
+                    continue ;;
+                  invalid)
+                    # Submitted anyway. ChangeGuard records that it could not
+                    # read the file, which belongs on the Change record; the
+                    # summary says it now so nobody waits to find out.
+                    UNREADABLE="${UNREADABLE}${UNREADABLE:+, }${F} (${DETAIL})" ;;
+                esac
+
+                SZ=$(wc -c < /tmp/cg-file.yaml)
+                if [ $((BYTES + SZ)) -gt 262144 ]; then
+                  SKIPPED="${SKIPPED}${SKIPPED:+, }${F} (over the size ChangeGuard accepts)"
+                  continue
+                fi
+
+                printf -- '---\n# %s\n' "${F}" >> /tmp/cg-manifest.yaml
+                cat /tmp/cg-file.yaml >> /tmp/cg-manifest.yaml
+                printf '\n' >> /tmp/cg-manifest.yaml
+                BYTES=$((BYTES + SZ))
+                COUNT=$((COUNT + 1))
+                FILES="${FILES}${FILES:+, }${F}"
+                if [ "${KIND}" = "object" ] && [ -n "${DETAIL}" ]; then
+                  echo "${DETAIL}" | tr ';' '\n' | while IFS= read -r ID; do
+                    [ -n "${ID}" ] && printf '%s\t%s\n' "${ID}" "${F}" >> /tmp/cg-ids.txt
+                  done
+                fi
+              done < /tmp/cg-candidates.txt
+
+              # Two changed files defining the SAME object. ChangeGuard judges
+              # both and de-duplicates the findings, so the verdict is sound —
+              # but which one wins at apply time depends on the customer's
+              # tooling, not on anything ChangeGuard can see, so it says so
+              # rather than picking one silently.
+              if [ -s /tmp/cg-ids.txt ]; then
+                DUPES=$(cut -f1 /tmp/cg-ids.txt | sort | uniq -d | paste -sd', ' -)
+              fi
+
+              if [ "${COUNT}" = "0" ] && [ -z "${NOTE}" ]; then
+                NOTE="No Kubernetes manifest changed here, so ChangeGuard judged the environment rather than a proposed object. That is not the same as a manifest with nothing wrong with it."
+              fi
+            fi
+          fi
+
+          # The manifest stays in a file and never becomes a step output. A
+          # multi-line value passed through an output is truncated or
+          # reinterpreted, and a manifest that arrived subtly altered would be
+          # judged as though the customer had written it that way.
+          {
+            echo "count=${COUNT}"
+            echo "files=${FILES}"
+            echo "skipped=${SKIPPED}"
+            echo "unreadable=${UNREADABLE}"
+            echo "duplicates=${DUPES}"
+            echo "note<<CG_NOTE_EOF"
+            echo "${NOTE}"
+            echo "CG_NOTE_EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+          if [ "${COUNT}" != "0" ]; then
+            echo "Judging ${COUNT} proposed Kubernetes object(s): ${FILES}"
+          else
+            echo "${NOTE}"
+          fi
+          [ -z "${UNREADABLE}" ] || echo "Could not be read: ${UNREADABLE}"
+          [ -z "${DUPES}" ]      || echo "Defined more than once: ${DUPES}"
+          [ -z "${SKIPPED}" ]    || echo "Not submitted: ${SKIPPED}"
+
       - name: Pre-flight verdict
         id: preflight
         env:
@@ -114,6 +392,19 @@ jobs:
           CG_URL_VAR: ${{ vars.CHANGEGUARD_BACKEND_URL }}
           CG_ENV_IN: ${{ inputs.environment }}
           CG_ENV_VAR: ${{ vars.CHANGEGUARD_CLUSTER }}
+          # Environment, never inline: a pull request title is written by
+          # whoever opened the pull request.
+          CG_PR_TITLE: ${{ github.event.pull_request.title }}
+          # A push has no pull request title. The commit subject is what the
+          # person actually wrote, so it is the next-best name for the change.
+          CG_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          CG_PR_NUMBER: ${{ github.event.pull_request.number }}
+          CG_MANIFEST_COUNT: ${{ steps.proposed.outputs.count }}
+          CG_MANIFEST_FILES: ${{ steps.proposed.outputs.files }}
+          CG_MANIFEST_SKIPPED: ${{ steps.proposed.outputs.skipped }}
+          CG_MANIFEST_UNREADABLE: ${{ steps.proposed.outputs.unreadable }}
+          CG_MANIFEST_DUPES: ${{ steps.proposed.outputs.duplicates }}
+          CG_MANIFEST_NOTE: ${{ steps.proposed.outputs.note }}
         run: |
           set -euo pipefail
 
@@ -158,13 +449,35 @@ jobs:
             exit 1
           fi
 
+          # What the customer will read on the Change record months from now.
+          # A pull request title is what they called this change; the repo and
+          # commit are how ChangeGuard finds it again. The title is quoted from
+          # the environment, never interpolated.
+          CG_SUMMARY="${CG_PR_TITLE:-}"
+          if [ -z "${CG_SUMMARY}" ]; then
+            # First line only: a commit message body can be paragraphs, and
+            # the Change list shows one line.
+            CG_SUMMARY=$(printf '%s' "${CG_COMMIT_MESSAGE:-}" | head -n 1)
+          fi
+          if [ -z "${CG_SUMMARY}" ]; then
+            CG_SUMMARY="${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+          fi
+
+          # --rawfile, not --arg: the manifest is read from the file it was
+          # written to, so nothing has to survive a shell variable intact.
+          # jq emits it as a JSON string, escaping included.
+          [ -s /tmp/cg-manifest.yaml ] || : > /tmp/cg-manifest.yaml
           BODY=$(jq -n \
-            --arg cluster "${CG_CLUSTER}" \
-            --arg repo    "${GITHUB_REPOSITORY}" \
-            --arg sha     "${GITHUB_SHA}" \
-            --arg summary "${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg cluster  "${CG_CLUSTER}" \
+            --arg repo     "${GITHUB_REPOSITORY}" \
+            --arg sha      "${GITHUB_SHA}" \
+            --arg summary  "${CG_SUMMARY}" \
+            --argjson prnum "${CG_PR_NUMBER:-0}" \
+            --rawfile manifest /tmp/cg-manifest.yaml \
             '{cluster_id: $cluster, source: "ci", mode: "fast",
-              change: {summary: $summary, pr: {repo: $repo, sha: $sha}}}')
+              change: ({summary: $summary, pr: {repo: $repo, sha: $sha}}
+                       + (if $prnum > 0 then {pr: {repo: $repo, sha: $sha, number: $prnum}} else {} end)
+                       + (if ($manifest | length) > 0 then {manifest: $manifest} else {} end))}')
 
           # HTTP status is separated from the body so a misconfiguration is
           # never mistaken for a clean verdict.
@@ -240,10 +553,24 @@ jobs:
           # it, so a customer whose agent merely stopped reporting is never told
           # there is no environment.
           ENVSTATE=$(jq -r '.environment_state // empty' /tmp/cg-preflight.json)
-          # On the OIDC path the environment comes from the connection, not from
-          # this file, so report back what ChangeGuard actually judged against.
+          # On the OIDC path the environment comes from the CONNECTION, not from
+          # this file. ChangeGuard binds a repository's CI to the environment it
+          # was connected to, on purpose: a workflow file is edited by anyone who
+          # can open a pull request, and letting it name any environment it liked
+          # would make the binding decorative.
+          #
+          # So `environment:` is a request, not an instruction — and when it is
+          # not granted the customer is told, rather than reading a verdict about
+          # one environment while believing it is about another. Silence here
+          # would be the most expensive kind: correct, and misleading.
           ENVNAME=$(jq -r '.cluster_id // .environment // empty' /tmp/cg-preflight.json)
+          ENVASKED="${CG_CLUSTER}"
           [ -n "${ENVNAME}" ] && CG_CLUSTER="${ENVNAME}"
+          ENVNOTE=""
+          if [ -n "${ENVASKED}" ] && [ -n "${CG_CLUSTER}" ] && [ "${ENVASKED}" != "${CG_CLUSTER}" ]; then
+            ENVNOTE="This workflow asked for **${ENVASKED}**, and ChangeGuard judged **${CG_CLUSTER}** — the environment this repository is connected to. The connection decides, not the workflow file. Change it where the repository was connected."
+            echo "::warning title=ChangeGuard judged a different environment::asked for ${ENVASKED}, judged ${CG_CLUSTER} (the connected one)"
+          fi
 
           if [ -z "${CHANGE_ID}" ]; then
             echo "::warning title=No change identity returned::The outcome for this change will not be linked to this judgment."
@@ -285,9 +612,37 @@ jobs:
           {
             echo "## ${ICON} ChangeGuard — ${VERDICT}"
             echo ""
-            echo "**${HEAD}** · confidence ${CSC:-n/a}/100"
+            if [ "${EVIDENCE}" = "present" ]; then
+              echo "**${HEAD}** · confidence ${CSC:-n/a}/100"
+            else
+              # No environment evidence means no environment score. Saying
+              # "0/100" here would report an unmeasured environment as the
+              # worst possible one.
+              echo "**${HEAD}** · no environment score — this change was judged on itself"
+            fi
             echo ""
             [ -n "${EVLINE}" ] && echo "${EVLINE}" && echo ""
+            [ -n "${ENVNOTE}" ] && echo "${ENVNOTE}" && echo ""
+            if [ "${CG_MANIFEST_COUNT:-0}" != "0" ]; then
+              echo "Judged the change you proposed: \`${CG_MANIFEST_FILES}\`."
+            elif [ -n "${CG_MANIFEST_NOTE:-}" ]; then
+              echo "${CG_MANIFEST_NOTE}"
+            fi
+            echo ""
+            if [ -n "${CG_MANIFEST_UNREADABLE:-}" ]; then
+              echo "ChangeGuard could not read: ${CG_MANIFEST_UNREADABLE}"
+              echo ""
+              echo "It was still submitted, so the Change record says so — but a file ChangeGuard cannot parse is a part of this change it could not judge, which is not the same as a part it found nothing wrong with."
+              echo ""
+            fi
+            if [ -n "${CG_MANIFEST_DUPES:-}" ]; then
+              echo "Defined in more than one changed file: ${CG_MANIFEST_DUPES}. All of them were judged; which one applies depends on your tooling, not on anything ChangeGuard can see."
+              echo ""
+            fi
+            if [ -n "${CG_MANIFEST_SKIPPED:-}" ]; then
+              echo "Not judged: ${CG_MANIFEST_SKIPPED}"
+              echo ""
+            fi
             jq -r '.reasons // [] | .[] | "- " + .' /tmp/cg-preflight.json
             echo ""
             if [ -n "${CHANGE_ID}" ]; then
