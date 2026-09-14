@@ -259,8 +259,19 @@ jobs:
                 # usually is not valid YAML — classifying it would report a
                 # syntax error in a file whose syntax is fine until it is
                 # rendered.
+                #
+                # But `{{` alone does not make a file a Helm template. A
+                # GitHub Actions workflow is full of `${{ }}` and is not a
+                # manifest in any state of rendering, so telling its author to
+                # "point it at the output of helm template" is a confident
+                # answer to a question nobody asked. A templated file is only
+                # reported as a template if it is at least TRYING to be a
+                # Kubernetes object; one that is not is simply not a candidate,
+                # and is passed over the same as any other YAML in the repo.
                 if grep -qF '{{' /tmp/cg-file.yaml; then
-                  SKIPPED="${SKIPPED}${SKIPPED:+, }${F} (a template — ChangeGuard judges rendered manifests, so point it at the output of helm template or kustomize build)"
+                  if grep -qE '^[[:space:]]*apiVersion:' /tmp/cg-file.yaml; then
+                    SKIPPED="${SKIPPED}${SKIPPED:+, }${F} (a template — ChangeGuard judges rendered manifests, so point it at the output of helm template or kustomize build)"
+                  fi
                   continue
                 fi
 
@@ -381,6 +392,9 @@ jobs:
           # Environment, never inline: a pull request title is written by
           # whoever opened the pull request.
           CG_PR_TITLE: ${{ github.event.pull_request.title }}
+          # A push has no pull request title. The commit subject is what the
+          # person actually wrote, so it is the next-best name for the change.
+          CG_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
           CG_PR_NUMBER: ${{ github.event.pull_request.number }}
           CG_MANIFEST_COUNT: ${{ steps.proposed.outputs.count }}
           CG_MANIFEST_FILES: ${{ steps.proposed.outputs.files }}
@@ -437,6 +451,11 @@ jobs:
           # commit are how ChangeGuard finds it again. The title is quoted from
           # the environment, never interpolated.
           CG_SUMMARY="${CG_PR_TITLE:-}"
+          if [ -z "${CG_SUMMARY}" ]; then
+            # First line only: a commit message body can be paragraphs, and
+            # the Change list shows one line.
+            CG_SUMMARY=$(printf '%s' "${CG_COMMIT_MESSAGE:-}" | head -n 1)
+          fi
           if [ -z "${CG_SUMMARY}" ]; then
             CG_SUMMARY="${GITHUB_REPOSITORY}@${GITHUB_SHA}"
           fi
