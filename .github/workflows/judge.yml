@@ -261,8 +261,11 @@ jobs:
                 # rendered.
                 #
                 # But `{{` alone does not make a file a Helm template. A
-                # GitHub Actions workflow is full of `${{ }}` and is not a
-                # manifest in any state of rendering, so telling its author to
+                # GitHub Actions workflow is full of expression syntax and
+                # is not a manifest in any state of rendering (this comment
+                # cannot show you the syntax, because GitHub expands it inside
+                # a run block too — which is how this file broke the first
+                # time). Telling its author to
                 # "point it at the output of helm template" is a confident
                 # answer to a question nobody asked. A templated file is only
                 # reported as a template if it is at least TRYING to be a
